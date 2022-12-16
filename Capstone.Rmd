@@ -1,0 +1,697 @@
+---
+title: "Capstone Project"
+output:
+  pdf_document: default
+date: "2022-12-10"
+---
+
+
+
+```{r}
+library(rmarkdown)
+library(dplyr)       # basic data manipulation and plotting
+library(ggplot2)     # data visualization
+library(h2o) # performing dimension reduction
+library(RIA)
+h2o.init()
+```
+
+
+
+```{r}
+# Helper packages
+  # for awesome graphics
+library(rsample)  # for data splitting
+
+# Modeling packages
+library(caret)    # for classification and regression training
+library(kernlab)  # for fitting SVMs
+library(modeldata) #for attrition data
+
+# Model interpretability packages
+library(pdp)      # for partial dependence plots, etc.
+library(vip)      # for variable importance plots
+
+
+library(readr)
+library(dplyr)
+library(plyr)
+
+```
+
+
+
+```{r}
+#Load the dataset
+df = read.csv("radiomics_completedata.csv")
+```
+
+
+## Model 1 (GLM, RF, GBM)
+
+
+
+```{r}
+#Check for null and missing values
+df <- na.omit(df)
+```
+
+
+```{r}
+#Check for normality, if not, normalized the data
+newdf1 = select(df, -c("Institution","Failure.binary", "Failure"))
+newdf1  <- scale(newdf1[c(1:10)])
+head(newdf1, 5)
+```
+
+```{r}
+#Get the correlation of the whole data expect the categorical variables
+library(caret)
+
+cor.newdf1 = cor(newdf1)
+corr = round(cor.newdf1,2)
+
+corMatrix =  cor(newdf1, y = NULL, use = "ev")
+highly_correlated_columns = findCorrelation(
+  corMatrix,
+  cutoff = 0.85, # correlation coefficient
+  verbose = FALSE,
+  names = FALSE,
+  exact = TRUE
+)
+DT <- newdf1[, -highly_correlated_columns]
+
+finaldata <- cbind(df['Failure.binary'], DT)
+
+
+```
+
+```{r}
+# Helper packages
+library(rsample)   # for creating our train-test splits
+library(recipes)   # for minor feature engineering tasks
+
+# Modeling packages
+library(h2o)       # for fitting stacked models
+
+```
+
+```{r}
+#Split the data into training (80%) and testing (20%)
+
+set.seed(123)  # for reproducibility
+split <- initial_split(finaldata,  prop = 0.8, strata = "Failure.binary")
+radio_train <- training(split)
+radio_test <- testing(split)
+```
+
+```{r}
+# Make sure we have consistent categorical levels
+blueprint <- recipe(Failure.binary ~ ., data = radio_train) %>%
+  step_other(all_nominal(), threshold = 0.005)
+blueprint
+```
+
+```{r}
+# Create training & test sets for h2o
+h2o.init()
+train_h2o <- prep(blueprint, training = radio_train, retain = TRUE) %>%
+  juice() %>%
+  as.h2o()
+train_h2o 
+
+test_h2o <- prep(blueprint, training = radio_train) %>%
+  bake(new_data = radio_test) %>%
+  as.h2o()
+```
+
+```{r}
+# Get response and feature names
+
+
+Y <- "Failure.binary"
+X <- setdiff(names(radio_train), Y)
+```
+
+```{r}
+# Train & cross-validate a GLM model
+best_glm <- h2o.glm(
+  x = X, y = Y, training_frame = as.factor(train_h2o), alpha = 0.1,
+  remove_collinear_columns = TRUE, nfolds = 10, fold_assignment = "Modulo",
+  keep_cross_validation_predictions = TRUE, seed = 123
+)
+
+```
+
+```{r}
+# Train & cross-validate a GBM model
+best_gbm <- h2o.gbm(
+  x = X, y = Y, training_frame = as.factor(train_h2o), ntrees = 5000, learn_rate = 0.01,
+  max_depth = 7, min_rows = 5, sample_rate = 0.8, nfolds = 10,
+  fold_assignment = "Modulo", keep_cross_validation_predictions = TRUE,
+  seed = 123, stopping_rounds = 50, stopping_metric = "AUC",
+  stopping_tolerance = 0
+)
+```
+
+
+```{r}
+best_rf <- h2o.randomForest(
+  x = X, y = Y, training_frame = as.factor(train_h2o), ntrees = 1000, mtries = 1,
+  max_depth = 30, min_rows = 1, sample_rate = 0.8, nfolds = 10,
+  fold_assignment = "Modulo", keep_cross_validation_predictions = TRUE,
+  seed = 123, stopping_rounds = 50, stopping_metric = "AUC",
+  stopping_tolerance = 0
+)
+
+```
+
+```{r}
+# Get results from base learners
+get_rmse <- function(model) {
+  results <- h2o.performance(model, newdata = test_h2o)
+  results@metrics$RMSE
+}
+list(best_glm, best_rf, best_gbm) %>%
+  purrr::map_dbl(get_rmse)
+
+```
+
+```{r}
+# Train a stacked tree ensemble
+ensemble_tree <- h2o.stackedEnsemble(
+  x = X, y = Y, training_frame = as.factor(train_h2o), model_id = "my_tree_ensemble",
+  base_models = list(best_glm, best_rf, best_gbm),
+  metalearner_algorithm = "drf"
+)
+```
+
+```{r}
+# Stacked results
+h2o.performance(ensemble_tree, newdata = test_h2o)@metrics$RMSE
+
+data.frame(
+  GLM_pred = as.vector(as.numeric(h2o.getFrame(best_glm@model$cross_validation_holdout_predictions_frame_id$name))),
+  RF_pred = as.vector(as.numeric(h2o.getFrame(best_rf@model$cross_validation_holdout_predictions_frame_id$name))),
+  GBM_pred = as.vector(as.numeric(h2o.getFrame(best_gbm@model$cross_validation_holdout_predictions_frame_id$name)))
+) %>% cor()
+```
+
+```{r}
+#Print the AUC values during Training
+perf1 <- h2o.performance(ensemble_tree, newdata = train_h2o)
+h2o.auc(perf1)
+
+```
+
+```{r}
+#Print the Top 20 important features during Training
+vip::vip(best_rf, 20)
+vip::vip(best_gbm, 20)
+vip::vip(best_glm, 20)
+
+```
+
+```{r}
+#calculate AUC values during testing
+perf <- h2o.performance(ensemble_tree, newdata = test_h2o)
+h2o.auc(perf)
+```
+
+
+
+## Model 3 (K-Means, Hierarchical & Model Based)
+
+## K-Means
+
+
+```{r}
+# Helper packages
+library(dplyr)       # for data manipulation
+library(ggplot2)     # for data visualization
+library(stringr)     # for string functionality
+library(gridExtra)   # for manipulaiting the grid
+
+# Modeling packages
+library(tidyverse)  # data manipulation
+library(cluster)     # for general clustering algorithms
+library(factoextra)  # for visualizing cluster results
+
+```
+
+```{r}
+#K-means
+
+#start at 2 clusters
+k2 <- kmeans(newdf1, centers = 2, nstart = 25)
+str(k2)
+
+```
+
+```{r}
+#plot the 2 clusters
+fviz_cluster(k2, data = newdf1)
+```
+
+```{r}
+ #get the each cluster's data
+df %>%
+  as_tibble() %>%
+  mutate(cluster = k2$cluster,
+         d = row.names(df)) %>%
+  ggplot(aes(Failure, Failure.binary, color = factor(cluster), label = d)) +
+  geom_text()
+
+k3 <- kmeans(newdf1, centers = 3, nstart = 25)
+k4 <- kmeans(newdf1, centers = 4, nstart = 25)
+k5 <- kmeans(newdf1, centers = 5, nstart = 25)
+```
+
+```{r}
+# plots to compare
+p1 <- fviz_cluster(k2, geom = "point", data = newdf1) + ggtitle("k = 2")
+p2 <- fviz_cluster(k3, geom = "point",  data = newdf1) + ggtitle("k = 3")
+p3 <- fviz_cluster(k4, geom = "point",  data = newdf1) + ggtitle("k = 4")
+p4 <- fviz_cluster(k5, geom = "point",  data = newdf1) + ggtitle("k = 5")
+
+grid.arrange(p1, p2, p3, p4, nrow = 2)
+
+```
+
+
+```{r}
+#Determining Optimal Number of Clusters
+set.seed(123)
+
+#function to compute total within-cluster sum of square 
+wss <- function(k) {
+  kmeans(newdf1, k, nstart = 10 )$tot.withinss
+}
+```
+
+```{r}
+# Compute and plot wss for k = 1 to k = 15
+k.values <- 1:15
+
+```
+
+```{r}
+# extract wss for 2-15 clusters
+wss_values <- map_dbl(k.values, wss)
+
+plot(k.values, wss_values,
+     type="b", pch = 19, frame = FALSE, 
+     xlab="Number of clusters K",
+     ylab="Total within-clusters sum of squares")
+```
+
+```{r}
+#or use this
+fviz_nbclust(newdf1, kmeans, method = "silhouette")
+```
+
+```{r}
+# compute gap statistic
+set.seed(123)
+gap_stat <- clusGap(newdf1, FUN = kmeans, nstart = 25,
+                    K.max = 10, B = 50)
+```
+
+```{r}
+# Print the result
+print(gap_stat, method = "firstmax")
+
+fviz_gap_stat(gap_stat)
+```
+
+```{r}
+# Compute k-means clustering with k = 2
+set.seed(123)
+final <- kmeans(newdf1, 2, nstart = 25)
+print(final)
+
+```
+
+```{r}
+#final data
+fviz_cluster(final, data = newdf1)
+```
+
+
+## Hierarchical 
+
+
+```{r}
+library(cluster)     # for general clustering algorithms
+library(factoextra)  # for visualizing cluster results
+
+```
+
+```{r}
+# Dissimilarity matrix
+d <- dist(newdf1, method = "euclidean")
+
+# Hierarchical clustering using Complete Linkage
+hc1 <- hclust(d, method = "complete" )
+```
+
+```{r}
+# For reproducibility
+set.seed(123)
+
+# Compute maximum or complete linkage clustering with agnes
+hc2 <- agnes(newdf1, method = "complete")
+
+# Agglomerative coefficient
+hc2$ac
+```
+
+```{r}
+# methods to assess
+m <- c( "average", "single", "complete", "ward")
+names(m) <- c( "average", "single", "complete", "ward")
+
+```
+
+```{r}
+# function to compute coefficient
+ac <- function(x) {
+  agnes(newdf1, method = x)$ac
+}
+
+# get agglomerative coefficient for each linkage method
+purrr::map_dbl(m, ac)
+
+```
+
+```{r}
+# compute divisive hierarchical clustering
+hc4 <- diana(df)
+
+# Divise coefficient; amount of clustering structure found
+hc4$dc
+```
+
+```{r}
+# Plot cluster results
+p1 <- fviz_nbclust(newdf1, FUN = hcut, method = "wss", 
+                   k.max = 10) +
+  ggtitle("(A) Elbow method")
+p2 <- fviz_nbclust(newdf1, FUN = hcut, method = "silhouette", 
+                   k.max = 10) +
+  ggtitle("(B) Silhouette method")
+p3 <- fviz_nbclust(newdf1, FUN = hcut, method = "gap_stat", 
+                   k.max = 10) +
+  ggtitle("(C) Gap statistic")
+
+# Display plots side by side
+gridExtra::grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+```{r}
+# Construct dendorgram 
+hc5 <- hclust(d, method = "ward.D2" )
+dend_plot <- fviz_dend(hc5)
+dend_data <- attr(dend_plot, "dendrogram")
+dend_cuts <- cut(dend_data, h = 2)
+fviz_dend(dend_cuts$lower[[1]])
+```
+
+```{r}
+# Ward's method
+hc5 <- hclust(d, method = "ward.D2" )
+```
+
+```{r}
+# Cut tree into 4 groups
+sub_grp <- cutree(hc5, k = 2)
+
+```
+
+```{r}
+# Number of members in each cluster
+table(sub_grp)
+```
+
+```{r}
+# Plot full dendogram
+fviz_dend(
+  hc5,
+  k = 2,
+  horiz = TRUE,
+  rect = TRUE,
+  rect_fill = TRUE,
+  rect_border = "jco",
+  k_colors = "jco",
+  cex = 0.1
+)
+```
+
+
+
+## Model Based
+
+
+
+```{r}
+
+
+
+# Modeling packages
+library(mclust)   # for fitting clustering algorithms
+
+```
+```{r}
+#Model Based
+
+# Apply GMM model with 3 components
+radio_mc <- Mclust(newdf1, G = 3)
+
+```
+
+```{r}
+# Plot results
+plot(radio_mc, what = "density")
+plot(radio_mc, what = "uncertainty")
+
+
+
+```
+
+```{r}
+# Observations with high uncertainty
+sort(radio_mc$uncertainty, decreasing = TRUE) %>% head()
+
+```
+
+
+```{r}
+summary(radio_mc)
+
+```
+
+
+
+```{r}
+radio_optimal_mc <- Mclust(newdf1)
+
+summary(radio_optimal_mc)
+
+
+```
+
+```{r}
+legend_args <- list(x = "bottomright", ncol = 5)
+plot(radio_optimal_mc, what = 'BIC', legendArgs = legend_args)
+plot(radio_optimal_mc, what = 'classification')
+plot(radio_optimal_mc, what = 'uncertainty')
+
+
+
+```
+
+
+
+```{r}
+df_mc <- Mclust(newdf1, 1:5)
+
+summary(df_mc)
+```
+
+
+```{r}
+plot(df_mc, what = 'BIC', 
+     legendArgs = list(x = "bottomright", ncol = 5))
+
+
+```
+
+
+```{r}
+probabilities <- df_mc$z 
+
+probabilities <- probabilities %>%
+  as.data.frame() %>%
+  dplyr::mutate(id = row_number()) %>%
+  tidyr::gather(cluster, probability, -id)
+
+ggplot(probabilities, aes(probability)) +
+  geom_histogram() +
+  facet_wrap(~ cluster, nrow = 2)
+
+
+```
+
+
+
+```{r}
+uncertainty <- data.frame(
+  id = 1:nrow(newdf1),
+  cluster = df_mc$classification,
+  uncertainty = df_mc$uncertainty
+)
+
+uncertainty %>%
+  group_by(cluster) %>%
+  filter(uncertainty > 0.0001) %>%
+  ggplot(aes(uncertainty, reorder(id, uncertainty))) +
+  geom_point() +
+  facet_wrap(~ cluster, scales = 'free_y', nrow = 1)
+
+```
+
+
+
+
+
+```{r}
+cluster2 <- newdf1 %>%
+  scale() %>%
+  as.data.frame() %>%
+  mutate(cluster = df_mc$classification) %>%
+  filter(cluster == 2) %>%
+  select(-cluster)
+
+cluster2 %>%
+  tidyr::gather(product, std_count) %>%
+  group_by(product) %>%
+  dplyr::summarize(avg = mean(std_count)) %>%
+  ggplot(aes(avg, reorder(product, avg))) +
+  geom_point() +
+  labs(x = "Average standardized consumption", y = NULL)
+```
+
+
+
+## Model 2
+
+
+```{r}
+library(tensorflow)
+library(keras)
+library(caret)
+```
+
+```{r}
+#splitting the data into training and testing
+index<-createDataPartition(finaldata$Failure.binary, p=0.8,list=F)
+```
+
+```{r}
+#Test labels in the Species column (column 5)
+Train_Features <- data.matrix(finaldata[index,-5])
+Train_Labels <- finaldata[index,5]
+Test_Features <- data.matrix(finaldata[-index,-5])
+Test_Labels <- finaldata[-index,5]
+```
+
+```{r}
+#convering the labels into categorical
+to_categorical(as.numeric(Train_Labels))[,c(-1)] -> Train_Labels
+to_categorical(as.numeric(Test_Labels))[,c(-1)] -> Test_Labels
+
+#summary statistics
+summary(Train_Labels)
+```
+
+
+```{r}
+#printing the structures of the datasest
+str(Train_Features)
+
+```
+
+
+```{r}
+#converting the features into matrix
+as.matrix(apply(Train_Features, 2, function(x) (x-min(x))/(max(x) - min(x)))) -> Train_Features
+as.matrix(apply(Test_Features, 2, function(x) (x-min(x))/(max(x) - min(x)))) -> Test_Features
+
+```
+
+
+
+```{r}
+#model training
+model <- keras_model_sequential() %>%
+  layer_dense(units = 256, activation = "sigmoid", input_shape = ncol(Train_Features)) %>%
+  layer_dropout(rate = 0.25) %>% 
+  layer_dense(units = 128, activation = "sigmoid") %>%
+  layer_dropout(rate = 0.25) %>% 
+  layer_dense(units = 128, activation = "sigmoid") %>%
+  layer_dropout(rate = 0.25) %>% 
+  layer_dense(units = 64, activation = "sigmoid") %>%
+  layer_dropout(rate = 0.25) %>%
+  layer_dense(units = 64, activation = "sigmoid") %>%
+  layer_dropout(rate = 0.25) %>%
+  layer_dense(units = 2, activation = "softmax")
+summary(model)
+
+```
+
+
+```{r}
+# Backpropagation
+model %>% compile(
+  loss = 'categorical_crossentropy',
+  optimizer = optimizer_rmsprop(),
+  metrics = c('accuracy')
+)
+
+```
+
+
+```{r}
+#compiling the model
+model %>% compile(
+  loss = "categorical_crossentropy",
+  optimizer = optimizer_adam(),
+  metrics = c("accuracy")
+)
+```
+
+```{r}
+#trained model history
+history <- model %>% 
+  fit(Train_Features, Train_Labels, epochs = 10, batch_size = 128, validation_split = 0.15)
+
+```
+
+
+
+```{r}
+#evaluating using test datasets
+model %>% evaluate(Test_Features,Test_Labels)
+
+```
+
+
+
+```{r}
+#model prediction
+model %>%
+  predict_classes(Test_Features)
+```
+
+
+
